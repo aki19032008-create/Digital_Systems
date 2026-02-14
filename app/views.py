@@ -1,135 +1,124 @@
-import cv2
-import mediapipe as mp
-import numpy as np
 from django.shortcuts import render
 from django.http import StreamingHttpResponse
+from .models import Attendance
+from django.conf import settings
+from datetime import datetime
+import cv2
+import pandas as pd
+import numpy as np
+import os
+import time
 
-# --------------------------------------------------
+# =====================
 # GLOBALS
-# --------------------------------------------------
+# =====================
+camera = None
+attendance_marked = False
+TIME_LIMIT = 15  # seconds
 
-camera = cv2.VideoCapture(0)
+# =====================
+# LOAD STUDENTS FROM CSV
+# =====================
+CSV_PATH = os.path.join(settings.BASE_DIR, 'data', 'students.csv')
 
-blink_count = 0
-blink_done = False
-face_detected = False
+def load_students():
+    df = pd.read_csv(CSV_PATH)
 
-# DEFAULT STUDENT (TEMP – no DB, no CSV)
-recognized_student = None
-DEFAULT_STUDENT = {
-    "roll": "101",
-    "name": "Arun",
-    "status": "Present"
-}
+    faces = []
+    labels = []
+    label_map = {}
+    label_id = 0
 
-# --------------------------------------------------
-# MEDIAPIPE SETUP
-# --------------------------------------------------
+    for _, row in df.iterrows():
+        img_path = os.path.join(settings.BASE_DIR, row['image'])
+        gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
 
-mp_face = mp.solutions.face_detection
-mp_mesh = mp.solutions.face_mesh
+        if gray is None:
+            continue
 
-face_detection = mp_face.FaceDetection(min_detection_confidence=0.7)
-face_mesh = mp_mesh.FaceMesh(max_num_faces=1)
+        faces.append(gray)
+        labels.append(label_id)
 
-# --------------------------------------------------
-# EAR (Blink Detection)
-# --------------------------------------------------
+        label_map[label_id] = {
+            "roll_no": row['roll_no'],
+            "name": row['name'],
+            "department": row['department']
+        }
+        label_id += 1
 
-LEFT_EYE = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+    return faces, labels, label_map
 
-def eye_aspect_ratio(landmarks, eye_points):
-    p = landmarks
-    A = np.linalg.norm(p[eye_points[1]] - p[eye_points[5]])
-    B = np.linalg.norm(p[eye_points[2]] - p[eye_points[4]])
-    C = np.linalg.norm(p[eye_points[0]] - p[eye_points[3]])
-    return (A + B) / (2.0 * C)
+# =====================
+# FACE DETECTOR + RECOGNIZER
+# =====================
+face_detector = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
 
-# --------------------------------------------------
-# PAGES
-# --------------------------------------------------
+recognizer = cv2.face.LBPHFaceRecognizer_create()
 
+# =====================
+# HOME
+# =====================
 def home(request):
-    return render(request, 'app/home.html')
+    return render(request, "app/home.html")
 
-def staff_login(request):
-    return render(request, 'app/staff_login.html')
-
+# =====================
+# ATTENDANCE PAGE
+# =====================
 def attendance_register(request):
-    return render(
-        request,
-        'app/attendance_register.html',
-        {'student': recognized_student}
-    )
+    records = Attendance.objects.all().order_by('-id')
+    return render(request, "app/attendance_register.html", {
+        "records": records
+    })
 
-# --------------------------------------------------
-# CAMERA STREAM (Face + Blink)
-# --------------------------------------------------
+# =====================
+# STAFF LOGIN
+# =====================
+def staff_login(request):
+    return render(request, "app/staff_login.html")
 
+# =====================
+# CAMERA STREAM
+# =====================
 def gen_frames():
-    global blink_count, blink_done, face_detected, recognized_student
+    global camera, attendance_marked
+
+    faces, labels, label_map = load_students()
+    recognizer.train(faces, np.array(labels))
+
+    camera = cv2.VideoCapture(0)
+    start_time = time.time()
 
     while True:
         success, frame = camera.read()
         if not success:
             break
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, _ = frame.shape
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detected = face_detector.detectMultiScale(gray, 1.3, 5)
 
-        # ---------- FACE DETECTION ----------
-        face_results = face_detection.process(rgb)
+        for (x, y, w, h) in detected:
+            roi = gray[y:y+h, x:x+w]
+            label, confidence = recognizer.predict(roi)
 
-        if face_results.detections:
-            face_detected = True
+            if confidence < 80 and not attendance_marked:
+                student = label_map[label]
 
-            for det in face_results.detections:
-                box = det.location_data.relative_bounding_box
-                x = int(box.xmin * w)
-                y = int(box.ymin * h)
-                bw = int(box.width * w)
-                bh = int(box.height * h)
-
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-
-        else:
-            face_detected = False
-            blink_count = 0
-            blink_done = False
-            recognized_student = None
-
-        # ---------- BLINK CHECK ----------
-        mesh_results = face_mesh.process(rgb)
-
-        if mesh_results.multi_face_landmarks:
-            for face_landmarks in mesh_results.multi_face_landmarks:
-                landmarks = np.array(
-                    [(lm.x * w, lm.y * h) for lm in face_landmarks.landmark]
+                Attendance.objects.create(
+                    name=student["name"],
+                    date=datetime.now().date(),
+                    time=datetime.now().time(),
+                    status="Present"
                 )
 
-                left_ear = eye_aspect_ratio(landmarks, LEFT_EYE)
-                right_ear = eye_aspect_ratio(landmarks, RIGHT_EYE)
-                ear = (left_ear + right_ear) / 2
+                attendance_marked = True
 
-                if ear < 0.20:
-                    blink_count += 1
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
-                if blink_count >= 2:
-                    blink_done = True
-                    recognized_student = DEFAULT_STUDENT
-
-        # ---------- DISPLAY ----------
-        if blink_done:
-            cv2.putText(
-                frame,
-                "Liveness Verified",
-                (30, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
-                2
-            )
+        # ⏱ AUTO STOP AFTER TIME LIMIT
+        if time.time() - start_time > TIME_LIMIT:
+            break
 
         ret, buffer = cv2.imencode('.jpg', frame)
         frame = buffer.tobytes()
@@ -139,11 +128,16 @@ def gen_frames():
             b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
         )
 
-# --------------------------------------------------
-# STREAM VIEW
-# --------------------------------------------------
+    camera.release()
+    cv2.destroyAllWindows()
 
+# =====================
+# START ATTENDANCE
+# =====================
 def start_face_detection(request):
+    global attendance_marked
+    attendance_marked = False
+
     return StreamingHttpResponse(
         gen_frames(),
         content_type='multipart/x-mixed-replace; boundary=frame'
